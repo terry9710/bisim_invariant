@@ -90,6 +90,7 @@ class BisimAgent(object):
             nn.Linear(512, 1)).to(device)
 
 #####################
+# 添加带有 env_index 的reward decoder
         self.reward_env_decoder = nn.Sequential(
             nn.Linear(encoder_feature_dim + 1, 512),
             nn.LayerNorm(512),
@@ -129,20 +130,21 @@ class BisimAgent(object):
             self.critic.encoder.parameters(), lr=encoder_lr
         )
 
-############################
-        # optimizer for reward
+############################添加新的optimizer
+#将reward和transition分开后，对各自的模型建立新的optimizer
+        # optimizer for reward and reward_env（同步更新两个reward model）
         self.reward_model_optimizer = torch.optim.Adam(
-            self.reward_decoder.parameters(), lr=decoder_lr
+            list(self.reward_decoder.parameters()) + list(self.reward_env_decoder.parameters()), lr=decoder_lr
         )
-        #optimizer for transition
+        #optimizer for transition_model
         self.transition_model_optimizer = torch.optim.Adam(
             self.transition_model.parameters(), lr=decoder_lr
         )
-        #optimizer for encoder
+        #optimizer for encoder_model
         self.encoder_model_optimizer = torch.optim.Adam(
             self.critic.encoder.parameters()
         )
-#############################
+###############################
         self.train()
         self.critic_target.train()
 
@@ -262,6 +264,7 @@ class BisimAgent(object):
         L.log('train_ae/encoder_loss', loss, step)
         return loss
 
+###原代码的transition reward loss
     def update_transition_reward_model(self, obs, action, next_obs, reward, L, step):
         h = self.critic.encoder(obs)
         pred_next_latent_mu, pred_next_latent_sigma = self.transition_model(torch.cat([h, action], dim=1))
@@ -280,6 +283,7 @@ class BisimAgent(object):
         total_loss = loss + reward_loss
         return total_loss
 
+#原代码的transition reward loss中reward的部分
     def update_reward_model(self, obs, action, next_obs, reward, env_index, L, step ):
 
         h = self.critic.encoder(obs)
@@ -293,6 +297,7 @@ class BisimAgent(object):
 
         return reward_loss, reward_env_loss
 
+# 原代码的transition reward loss中transition的部分
     def updata_transition_model(self, obs, action, next_obs, reward, env_index, L, step):
 
         h = self.critic.encoder(obs)
@@ -307,55 +312,45 @@ class BisimAgent(object):
 
         return transition_loss
 
-    def updata_encoder_model(self, obs, action, next_obs, reward, env_index, L, step):
-
-        BETA = 0.01
-
-        h = self.critic.encoder(obs)
-        pred_next_latent_mu, pred_next_latent_sigma = self.transition_model(torch.cat([h, action], dim=1))
-        if pred_next_latent_sigma is None:
-            pred_next_latent_sigma = torch.ones_like(pred_next_latent_mu)
-
-        #taeget
-        taget_h = self.critic_target.encoder(obs)
-
-        diff = (pred_next_latent_mu - taget_h.detach()) / pred_next_latent_sigma
-        encoder_loss = torch.mean(0.5 * diff.pow(2) + torch.log(pred_next_latent_sigma))
-
-        return encoder_loss
-
 
     def update(self, replay_buffer, L, step):
         #sample batch data
         obs, action, _, reward, next_obs, not_done, env_index = replay_buffer.sample()
 
+        # print(env_index)
         L.log('train/batch_reward', reward.mean(), step)
 
         self.update_critic(obs, action, reward, next_obs, not_done, L, step)
-###########
+###########原代码
+        # transition_reward_loss = self.update_transition_reward_model(obs, action, next_obs, reward, L, step)
+        # encoder_loss = self.update_encoder(obs, action, reward, L, step)
+        # total_loss = self.bisim_coef * encoder_loss + transition_reward_loss
+        # self.encoder_optimizer.zero_grad()
+        # self.decoder_optimizer.zero_grad()
+        # total_loss.backward()
+        # self.encoder_optimizer.step()
+        # self.decoder_optimizer.step()
+###########修改后
+        ###reward update
         reward_loss, reward_env_loss = self.update_reward_model(obs, action, next_obs, reward, env_index, L, step)
         reward_total_loss = reward_loss + reward_env_loss
         self.reward_model_optimizer.zero_grad()
         reward_total_loss.backward()
         self.reward_model_optimizer.step()
-#############
+        #transition update 
+        #这部跟原代码的transition_reward_loss中 transition 部分相同
         transition_loss = self.updata_transition_model(obs, action, next_obs, reward, env_index, L, step)
         self.transition_model_optimizer.zero_grad()
         transition_loss.backward()
         self.transition_model_optimizer.step()
-##############
-        diff_lambda = 10
-        encoder_model_loss = self.updata_encoder_model(obs, action, next_obs, reward, env_index, L, step)
+        
+        ##invariant loss
         diff_loss = diff_lambda * torch.maximum(torch.tensor(0).to(self.device), reward_loss.detach() - reward_env_loss.detach())
-        # print(diff_loss.shape)
-        # print(encoder_model_loss.shape)
-        encoder_model_loss =  diff_loss + encoder_model_loss
-        self.encoder_model_optimizer.zero_grad()
-        encoder_model_loss.backward()
-        self.encoder_model_optimizer.step()
-###############
+        
+        #将invariant loss加到encoder loss中
         encoder_loss = self.update_encoder(obs, action, reward, L, step)
-        total_loss = self.bisim_coef * encoder_loss
+        total_loss = self.bisim_coef * encoder_loss + diff_loss
+        #这部分与源代码相同
         self.encoder_optimizer.zero_grad()
         self.decoder_optimizer.zero_grad()
         total_loss.backward()
